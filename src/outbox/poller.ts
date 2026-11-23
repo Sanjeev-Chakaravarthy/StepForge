@@ -46,7 +46,14 @@ export class OutboxPoller {
     this.timer = setTimeout(async () => {
       try {
         await this.pollOnce();
-      } catch (err) {
+      } catch (err: any) {
+        if (
+          !this.isRunning ||
+          err?.message?.includes('Connection is closed') ||
+          err?.message?.includes('Cannot use a pool after calling end')
+        ) {
+          return;
+        }
         console.error('Error during outbox polling:', err);
       } finally {
         this.scheduleNext();
@@ -89,7 +96,7 @@ export class OutboxPoller {
           await publishToRedisStream(this.redis, this.streamKey, event);
           publishedIds.push(event.id);
           if (
-            event.event_type === 'RUN_CREATED' &&
+            (event.event_type === 'RUN_CREATED' || event.event_type === 'RUN_RETRY') &&
             event.payload &&
             typeof event.payload === 'object' &&
             'run_id' in event.payload
@@ -122,7 +129,7 @@ export class OutboxPoller {
             `UPDATE runs
              SET status = 'QUEUED'::run_status,
                  updated_at = NOW()
-             WHERE id = ANY($1::uuid[]) AND status = 'PENDING'`,
+             WHERE id = ANY($1::uuid[]) AND status IN ('PENDING'::run_status, 'RETRYING'::run_status)`,
             [runIdsToQueue]
           );
         }
