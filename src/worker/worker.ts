@@ -4,8 +4,13 @@ import type { Pool } from '../db/client.js';
 import { RedisLeaseManager } from '../redis/lease.js';
 import type { Run, Tenant } from '../types/domain.js';
 import { DelayQueue } from './delay_queue.js';
+import { DurableStepContext, type StepContext } from '../step/context.js';
+import type { WorkflowRegistry } from '../workflow/registry.js';
 
-export type WorkflowHandler = (run: Run) => Promise<Record<string, unknown> | void>;
+export type WorkflowHandler = (
+  run: Run,
+  step: StepContext
+) => Promise<Record<string, unknown> | void>;
 
 export interface WorkerOptions {
   workerId?: string;
@@ -16,6 +21,7 @@ export interface WorkerOptions {
   batchSize?: number;
   blockTimeoutMs?: number;
   handler?: WorkflowHandler;
+  registry?: WorkflowRegistry;
 }
 
 export class Worker {
@@ -32,6 +38,7 @@ export class Worker {
   public readonly batchSize: number;
   public readonly blockTimeoutMs: number;
   private handler: WorkflowHandler;
+  private registry?: WorkflowRegistry;
 
   private isRunning: boolean = false;
   private activeHeartbeats: Map<string, NodeJS.Timeout> = new Map();
@@ -51,6 +58,7 @@ export class Worker {
     this.batchSize = options?.batchSize ?? 10;
     this.blockTimeoutMs = options?.blockTimeoutMs ?? 500;
     this.handler = options?.handler ?? (async () => ({ success: true }));
+    this.registry = options?.registry;
   }
 
   /**
@@ -248,7 +256,9 @@ export class Worker {
 
     // 5. Execute workflow handler
     try {
-      const output = await this.handler(run);
+      const stepContext = new DurableStepContext(this.pool, run.id);
+      const workflowFn = this.registry?.get(run.workflow_name) ?? this.handler;
+      const output = await workflowFn(run, stepContext);
 
       // Stop heartbeat
       clearInterval(heartbeatTimer);
