@@ -1,7 +1,9 @@
 import type { Pool } from '../db/client.js';
+import { DockerSandboxRunner, type SandboxOptions } from '../sandbox/docker.js';
 
 export interface StepContext {
   run: <T>(stepKey: string, fn: () => Promise<T>) => Promise<T>;
+  runSandboxed: <T>(stepKey: string, options: SandboxOptions) => Promise<T>;
 }
 
 export class DurableStepContext implements StepContext {
@@ -51,5 +53,17 @@ export class DurableStepContext implements StepContext {
     );
 
     return output;
+  }
+
+  /**
+   * Executes a durable step inside an ephemeral, resource-capped Docker container.
+   * Inherits the same durable memoization guarantees as `step.run`:
+   * if already completed, returns the cached output without spinning up a container.
+   */
+  public async runSandboxed<T>(stepKey: string, options: SandboxOptions): Promise<T> {
+    return this.run(stepKey, async () => {
+      const runner = new DockerSandboxRunner();
+      return await runner.execute<T>(options);
+    });
   }
 }
