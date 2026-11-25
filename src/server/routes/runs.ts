@@ -1,15 +1,167 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import crypto from 'node:crypto';
 import type { Pool } from '../../db/client.js';
 import { withTransaction } from '../../db/client.js';
-import type { Run, StepCheckpoint, Tenant } from '../../types/domain.js';
+import type {
+  ApprovalStatus,
+  Run,
+  RunApproval,
+  StepCheckpoint,
+  Tenant,
+} from '../../types/domain.js';
 
 const submitRunSchema = z.object({
   tenantId: z.string().min(1).max(64),
   input: z.record(z.string(), z.unknown()).optional().default({}),
   idempotencyKey: z.string().min(1).max(255).optional(),
 });
+
+const approvalDecisionSchema = z.object({
+  gateKey: z.string().min(1).max(255).optional(),
+  payload: z.unknown().optional().default({}),
+});
+
+const uuidSchema = z.string().uuid();
+
+async function resolveApprovalDecision(
+  pool: Pool,
+  c: Context,
+  decision: Extract<ApprovalStatus, 'APPROVED' | 'REJECTED'>
+) {
+  const runId = c.req.param('runId');
+  if (!uuidSchema.safeParse(runId).success) {
+    return c.json({ error: 'Invalid runId format' }, 400);
+  }
+  const rawText = await c.req.text();
+
+  let parsedBody: unknown = {};
+  if (rawText.trim().length > 0) {
+    try {
+      parsedBody = JSON.parse(rawText);
+    } catch {
+      return c.json({ error: 'Invalid JSON request body' }, 400);
+    }
+  }
+
+  const parsed = approvalDecisionSchema.safeParse(parsedBody);
+  if (!parsed.success) {
+    return c.json({ error: 'Validation failed', details: parsed.error.issues }, 400);
+  }
+
+  const { gateKey, payload } = parsed.data;
+
+  try {
+    const result = await withTransaction(pool, async (client) => {
+      const { rows: runRows } = await client.query<Run>(
+        `SELECT * FROM runs WHERE id = $1 FOR UPDATE`,
+        [runId]
+      );
+
+      const run = runRows[0];
+      if (!run) {
+        return { error: 'Run not found', statusCode: 404 as const };
+      }
+
+      if (run.status !== 'WAITING_HUMAN') {
+        return {
+          error: `Run is not awaiting human approval (current status: ${run.status})`,
+          statusCode: 409 as const,
+        };
+      }
+
+      const gateQuery = gateKey
+        ? {
+            sql: `SELECT * FROM run_approvals
+                  WHERE run_id = $1 AND gate_key = $2 AND status = 'PENDING'
+                  FOR UPDATE`,
+            params: [runId, gateKey],
+          }
+        : {
+            sql: `SELECT * FROM run_approvals
+                  WHERE run_id = $1 AND status = 'PENDING'
+                  ORDER BY id ASC
+                  LIMIT 1
+                  FOR UPDATE`,
+            params: [runId],
+          };
+
+      const { rows: approvalRows } = await client.query<RunApproval>(
+        gateQuery.sql,
+        gateQuery.params
+      );
+
+      const pendingGate = approvalRows[0];
+      if (!pendingGate) {
+        return {
+          error: gateKey
+            ? `No pending approval gate found for gateKey "${gateKey}"`
+            : 'No pending approval gate found for run',
+          statusCode: 409 as const,
+        };
+      }
+
+      const { rows: updatedApprovalRows } = await client.query<RunApproval>(
+        `UPDATE run_approvals
+         SET status = $1,
+             payload = $2::jsonb,
+             resolved_at = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [decision, JSON.stringify(payload ?? {}), pendingGate.id]
+      );
+
+      const { rows: updatedRunRows } = await client.query<Run>(
+        `UPDATE runs
+         SET status = 'PENDING'::run_status,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [runId]
+      );
+
+      const updatedRun = updatedRunRows[0]!;
+      const updatedApproval = updatedApprovalRows[0]!;
+
+      await client.query(
+        `INSERT INTO outbox_events (tenant_id, event_type, payload, status, available_at)
+         VALUES ($1, 'RUN_RESUMED', $2::jsonb, 'PENDING', NOW())`,
+        [
+          updatedRun.tenant_id,
+          JSON.stringify({
+            run_id: updatedRun.id,
+            tenant_id: updatedRun.tenant_id,
+            workflow_name: updatedRun.workflow_name,
+            idempotency_key: updatedRun.idempotency_key,
+            gate_key: updatedApproval.gate_key,
+            decision,
+            input: updatedRun.input,
+          }),
+        ]
+      );
+
+      return {
+        run: updatedRun,
+        approval: updatedApproval,
+        statusCode: 200 as const,
+      };
+    });
+
+    if ('error' in result) {
+      return c.json({ error: result.error }, result.statusCode);
+    }
+
+    return c.json(
+      {
+        run: result.run,
+        approval: result.approval,
+      },
+      result.statusCode
+    );
+  } catch (err: any) {
+    return c.json({ error: 'Failed to process approval decision', message: err.message }, 500);
+  }
+}
 
 export function createRunRoutes(pool: Pool) {
   const router = new Hono();
@@ -107,6 +259,16 @@ export function createRunRoutes(pool: Pool) {
     }
   });
 
+  // POST /api/v1/runs/:runId/approve
+  router.post('/runs/:runId/approve', async (c) => {
+    return resolveApprovalDecision(pool, c, 'APPROVED');
+  });
+
+  // POST /api/v1/runs/:runId/reject
+  router.post('/runs/:runId/reject', async (c) => {
+    return resolveApprovalDecision(pool, c, 'REJECTED');
+  });
+
   // GET /api/v1/runs/:id
   router.get('/runs/:id', async (c) => {
     const runId = c.req.param('id');
@@ -122,8 +284,16 @@ export function createRunRoutes(pool: Pool) {
     }
 
     const { rows: checkpointRows } = await pool.query<StepCheckpoint>(
-      `SELECT id, run_id, step_key, output, status, created_at
+      `SELECT id, run_id, step_key, step_type, output, metadata, status, created_at
        FROM step_checkpoints
+       WHERE run_id = $1
+       ORDER BY id ASC`,
+      [runId]
+    );
+
+    const { rows: approvalRows } = await pool.query<RunApproval>(
+      `SELECT id, run_id, gate_key, status, prompt_data, payload, created_at, resolved_at
+       FROM run_approvals
        WHERE run_id = $1
        ORDER BY id ASC`,
       [runId]
@@ -132,6 +302,7 @@ export function createRunRoutes(pool: Pool) {
     return c.json({
       run,
       checkpoints: checkpointRows,
+      approvals: approvalRows,
     });
   });
 

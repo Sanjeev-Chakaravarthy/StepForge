@@ -18,6 +18,7 @@ export class OutboxPoller {
   private isRunning: boolean = false;
   private timer: NodeJS.Timeout | null = null;
   private isPolling: boolean = false;
+  private activePollPromise: Promise<number> | null = null;
 
   constructor(pool: Pool, redis: Redis, options?: OutboxPollerOptions) {
     this.pool = pool;
@@ -33,11 +34,14 @@ export class OutboxPoller {
     this.scheduleNext();
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
     this.isRunning = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+    if (this.activePollPromise) {
+      await this.activePollPromise.catch(() => {});
     }
   }
 
@@ -65,10 +69,21 @@ export class OutboxPoller {
    * Executes a single poll cycle with FOR UPDATE SKIP LOCKED
    * Returns the count of processed outbox events.
    */
-  public async pollOnce(): Promise<number> {
-    if (this.isPolling) return 0;
+  public pollOnce(): Promise<number> {
+    if (this.isPolling) return Promise.resolve(0);
     this.isPolling = true;
 
+    const promise = this.executePollOnce().finally(() => {
+      this.isPolling = false;
+      if (this.activePollPromise === promise) {
+        this.activePollPromise = null;
+      }
+    });
+    this.activePollPromise = promise;
+    return promise;
+  }
+
+  private async executePollOnce(): Promise<number> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -96,7 +111,9 @@ export class OutboxPoller {
           await publishToRedisStream(this.redis, this.streamKey, event);
           publishedIds.push(event.id);
           if (
-            (event.event_type === 'RUN_CREATED' || event.event_type === 'RUN_RETRY') &&
+            (event.event_type === 'RUN_CREATED' ||
+              event.event_type === 'RUN_RETRY' ||
+              event.event_type === 'RUN_RESUMED') &&
             event.payload &&
             typeof event.payload === 'object' &&
             'run_id' in event.payload
@@ -129,7 +146,8 @@ export class OutboxPoller {
             `UPDATE runs
              SET status = 'QUEUED'::run_status,
                  updated_at = NOW()
-             WHERE id = ANY($1::uuid[]) AND status IN ('PENDING'::run_status, 'RETRYING'::run_status)`,
+             WHERE id = ANY($1::uuid[])
+               AND status IN ('PENDING'::run_status, 'RETRYING'::run_status, 'WAITING_HUMAN'::run_status)`,
             [runIdsToQueue]
           );
         }
@@ -142,7 +160,6 @@ export class OutboxPoller {
       throw err;
     } finally {
       client.release();
-      this.isPolling = false;
     }
   }
 }

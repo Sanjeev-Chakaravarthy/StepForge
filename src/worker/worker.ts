@@ -4,7 +4,12 @@ import type { Pool } from '../db/client.js';
 import { RedisLeaseManager } from '../redis/lease.js';
 import type { Run, Tenant } from '../types/domain.js';
 import { DelayQueue } from './delay_queue.js';
-import { DurableStepContext, type StepContext } from '../step/context.js';
+import {
+  ApprovalRejectedError,
+  DurableStepContext,
+  RunSuspendedError,
+  type StepContext,
+} from '../step/context.js';
 import type { WorkflowRegistry } from '../workflow/registry.js';
 
 export type WorkflowHandler = (
@@ -22,6 +27,7 @@ export interface WorkerOptions {
   blockTimeoutMs?: number;
   handler?: WorkflowHandler;
   registry?: WorkflowRegistry;
+  delayQueue?: DelayQueue;
 }
 
 export class Worker {
@@ -29,6 +35,7 @@ export class Worker {
   private redis: Redis;
   private leaseManager: RedisLeaseManager;
   private delayQueue: DelayQueue;
+  private ownsDelayQueue: boolean;
 
   public readonly workerId: string;
   public readonly streamKey: string;
@@ -48,7 +55,8 @@ export class Worker {
     this.pool = pool;
     this.redis = redis;
     this.leaseManager = new RedisLeaseManager(redis);
-    this.delayQueue = new DelayQueue(redis, { streamKey: options?.streamKey });
+    this.ownsDelayQueue = !options?.delayQueue;
+    this.delayQueue = options?.delayQueue ?? new DelayQueue(redis, { streamKey: options?.streamKey });
 
     this.workerId = options?.workerId ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
     this.streamKey = options?.streamKey ?? 'stepforge:stream:tasks';
@@ -78,7 +86,9 @@ export class Worker {
     if (this.isRunning) return;
     this.isRunning = true;
     await this.initGroup();
-    this.delayQueue.start();
+    if (this.ownsDelayQueue) {
+      this.delayQueue.start();
+    }
 
     this.processingPromise = (async () => {
       while (this.isRunning) {
@@ -95,16 +105,19 @@ export class Worker {
 
   public async stop(): Promise<void> {
     this.isRunning = false;
-    this.delayQueue.stop();
-
-    // Clear all active heartbeat timers
-    for (const [runId, timer] of this.activeHeartbeats.entries()) {
-      clearInterval(timer);
-      this.activeHeartbeats.delete(runId);
+    if (this.ownsDelayQueue) {
+      await this.delayQueue.stop();
     }
 
     if (this.processingPromise) {
       await this.processingPromise;
+      this.processingPromise = null;
+    }
+
+    // Clear any leftover heartbeat timers after in-flight batch settles
+    for (const [runId, timer] of this.activeHeartbeats.entries()) {
+      clearInterval(timer);
+      this.activeHeartbeats.delete(runId);
     }
   }
 
@@ -256,7 +269,13 @@ export class Worker {
 
     // 5. Execute workflow handler
     try {
-      const stepContext = new DurableStepContext(this.pool, run.id);
+      const stepContext = new DurableStepContext(this.pool, run.id, {
+        onSuspend: async () => {
+          clearInterval(heartbeatTimer);
+          this.activeHeartbeats.delete(runId);
+          await this.leaseManager.releaseLease(tenantId, runId);
+        },
+      });
       const workflowFn = this.registry?.get(run.workflow_name) ?? this.handler;
       const output = await workflowFn(run, stepContext);
 
@@ -279,6 +298,32 @@ export class Worker {
       // Stop heartbeat
       clearInterval(heartbeatTimer);
       this.activeHeartbeats.delete(runId);
+
+      // Clean HITL suspension: gate & WAITING_HUMAN state are already committed
+      if (handlerErr instanceof RunSuspendedError) {
+        return;
+      }
+
+      // Explicit human rejection: move straight to DEAD_LETTER without retries
+      if (handlerErr instanceof ApprovalRejectedError) {
+        const rejectionPayload = {
+          name: handlerErr.name,
+          message: handlerErr.message,
+          gateKey: handlerErr.gateKey,
+          payload: handlerErr.payload,
+        };
+        await this.pool.query(
+          `UPDATE runs
+           SET status = 'DEAD_LETTER'::run_status,
+               error = $1::jsonb,
+               current_lease_worker_id = NULL,
+               lease_expires_at = NULL,
+               updated_at = NOW()
+           WHERE id = $2`,
+          [JSON.stringify(rejectionPayload), runId]
+        );
+        return;
+      }
 
       const errPayload = {
         message: handlerErr?.message || 'Execution error',

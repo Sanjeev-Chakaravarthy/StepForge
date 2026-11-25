@@ -2,11 +2,16 @@ export type RunStatus =
   | 'PENDING'
   | 'QUEUED'
   | 'RUNNING'
+  | 'WAITING_HUMAN'
   | 'RETRYING'
   | 'COMPLETED'
   | 'DEAD_LETTER';
 
 export type OutboxStatus = 'PENDING' | 'PUBLISHED' | 'FAILED';
+
+export type StepType = 'STEP' | 'SANDBOX' | 'TOOL' | 'LLM';
+
+export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 
 export interface Tenant {
   id: string;
@@ -38,9 +43,22 @@ export interface StepCheckpoint {
   id: number;
   run_id: string;
   step_key: string;
+  step_type: StepType;
   output: unknown;
+  metadata: Record<string, unknown> | null;
   status: string;
   created_at: Date;
+}
+
+export interface RunApproval {
+  id: number;
+  run_id: string;
+  gate_key: string;
+  status: ApprovalStatus;
+  prompt_data: Record<string, unknown>;
+  payload: unknown;
+  created_at: Date;
+  resolved_at: Date | null;
 }
 
 export interface OutboxEvent {

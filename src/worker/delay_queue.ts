@@ -44,6 +44,7 @@ export class DelayQueue {
   private isRunning: boolean = false;
   private timer: NodeJS.Timeout | null = null;
   private isDispatching: boolean = false;
+  private activeDispatchPromise: Promise<number> | null = null;
 
   constructor(redis: Redis, options?: DelayQueueOptions) {
     this.redis = redis;
@@ -72,11 +73,14 @@ export class DelayQueue {
     this.scheduleNext();
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
     this.isRunning = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+    if (this.activeDispatchPromise) {
+      await this.activeDispatchPromise.catch(() => {});
     }
   }
 
@@ -97,10 +101,11 @@ export class DelayQueue {
   /**
    * Atomically moves matured delayed tasks back into the active Redis Stream.
    */
-  public async dispatchOnce(): Promise<number> {
-    if (this.isDispatching) return 0;
+  public dispatchOnce(): Promise<number> {
+    if (this.isDispatching) return Promise.resolve(0);
     this.isDispatching = true;
-    try {
+
+    const promise = (async () => {
       const nowMs = Date.now();
       const count = (await this.redis.eval(
         DISPATCH_DELAYED_LUA,
@@ -112,9 +117,15 @@ export class DelayQueue {
       )) as number;
 
       return count;
-    } finally {
+    })().finally(() => {
       this.isDispatching = false;
-    }
+      if (this.activeDispatchPromise === promise) {
+        this.activeDispatchPromise = null;
+      }
+    });
+
+    this.activeDispatchPromise = promise;
+    return promise;
   }
 
   public async getPendingDelayedCount(): Promise<number> {
