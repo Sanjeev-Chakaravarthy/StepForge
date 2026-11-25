@@ -260,3 +260,18 @@ k6 run benchmarks/noisy_neighbor.js
   - $p95 < 250\text{ms}$ latency for Tenant B.
   - Zero dropped requests (`http_req_failed < 0.01`).
   - Tenant A actively throttles and defers to delayed queues without monopolizing worker capacity.
+
+### Measured Benchmark Results
+
+Results from a 30-second noisy-neighbor run against `localhost:3000` (`k6 v2.4.0`, PostgreSQL 16, Redis 7):
+
+- **Total HTTP requests**: `1,654` (`~55.10 req/s`), `0.00%` failure rate, `1,652/1,652` checks passed (`100%`)
+- **`tenant_a_flood` (50 iters/s)**: `avg 4.46ms`, `med 4.23ms`, `p90 6.12ms`, `p95 6.73ms`, `max 14.39ms`
+- **`tenant_b_steady` (5 iters/s)**: `avg 3.81ms`, `med 3.70ms`, `p90 4.52ms`, `p95 4.70ms`, `p99 7.85ms`, `max 16.51ms`
+- **Overall iteration duration**: `avg 4.90ms`, `p95 7.41ms`, `max 18.18ms`
+
+| Scenario / Metric | Rate | avg | med | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|
+| `tenant_a_flood` (`http_req_duration`) | 50 iters/s | 4.46ms | 4.23ms | 6.12ms | 6.73ms | — | 14.39ms |
+| `tenant_b_steady` (`http_req_duration`) | 5 iters/s | 3.81ms | 3.70ms | 4.52ms | 4.70ms | 7.85ms | 16.51ms |
+| Overall `iteration_duration` | ~55.10 req/s | 4.90ms | — | — | 7.41ms | — | 18.18ms |
