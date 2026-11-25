@@ -1,8 +1,8 @@
 # StepForge
 
-**StepForge** is a headless, multi-tenant durable task orchestration and sandboxed execution engine built in TypeScript (Node.js, Hono, PostgreSQL, Redis, Docker). 
+**StepForge** is a headless, multi-tenant durable task orchestration, AI agent runtime, and sandboxed execution engine built in TypeScript (Node.js, Hono, PostgreSQL, Redis, Docker).
 
-It guarantees reliable workflow completion, idempotent step-level retries across ungraceful worker crashes (`SIGKILL` / OOM), multi-tenant concurrency fairness, and secure, isolated step execution inside resource-capped ephemeral Docker containers.
+It guarantees reliable workflow completion, idempotent step-level retries across ungraceful worker crashes (`SIGKILL` / OOM), multi-tenant concurrency fairness, Human-in-the-Loop (`WAITING_HUMAN`) suspend/resume with zero lease blocking, structured LLM/tool checkpointing, and secure, isolated step execution inside resource-capped ephemeral Docker containers.
 
 ---
 
@@ -16,6 +16,8 @@ It guarantees reliable workflow completion, idempotent step-level retries across
                                           v
                                +---------------------+
                                |  Hono HTTP Engine   |
+                               | (/runs, /approve,   |
+                               |  /reject, /tenants) |
                                +----------+----------+
                                           |
                        (Atomic Write: Run + Outbox Event)
@@ -25,6 +27,7 @@ It guarantees reliable workflow completion, idempotent step-level retries across
                          |     PostgreSQL (State Store)   |
                          |  - runs                        |
                          |  - step_checkpoints            |
+                         |  - run_approvals               |
                          |  - outbox_events               |
                          |  - tenants                     |
                          +---------------+----------------+
@@ -39,12 +42,13 @@ It guarantees reliable workflow completion, idempotent step-level retries across
                                          |
                                  (XADD Stream Events)
                                          v
-                           +---------------------------+
-                           |   Redis Stream & State    |
-                           |  - Stream: stepforge:tasks|
-                           |  - Lua Concurrency Engine |
-                           |  - Tenant Lease Sets      |
-                           +-------------+-------------+
+                           +-----------------------------+
+                           |    Redis Stream & State     |
+                           |  - Stream: stepforge:tasks  |
+                           |  - DelayQueue: delayed_tasks|
+                           |  - Lua Concurrency Engine   |
+                           |  - Tenant Lease Sets        |
+                           +-------------+---------------+
                                          |
                              (XREADGROUP / Worker Loop)
                                          |
@@ -52,7 +56,8 @@ It guarantees reliable workflow completion, idempotent step-level retries across
                     +----------------------------------------+
                     |              Worker Pool               |
                     |  - Lua Lease Acquisition & Heartbeat   |
-                    |  - Step Checkpoint Runner (step.run)   |
+                    |  - Step Runner (run/llm/tool/sandbox)  |
+                    |  - HITL Suspend/Resume (WAITING_HUMAN) |
                     |  - State Machine Transitions (Postgres)|
                     +--------------------+-------------------+
                                          |
@@ -61,7 +66,7 @@ It guarantees reliable workflow completion, idempotent step-level retries across
                     v                                        v
        +--------------------------+             +--------------------------+
        | Internal JS/TS Executors |             | Ephemeral Docker Sandbox |
-       | (Native In-Memory)       |             | (--cpus, --memory,       |
+       | (LLM / Tool / HITL Gates)|             | (--cpus, --memory,       |
        |                          |             |  --network=none, tmpfs)  |
        +--------------------------+             +--------------------------+
                     ^
@@ -77,16 +82,16 @@ It guarantees reliable workflow completion, idempotent step-level retries across
 ## Core Invariants & Guarantees
 
 ### 1. Transactional Outbox (Dual-Write Prevention)
-- Run creation and outbox event logging occur inside the **exact same PostgreSQL transaction**.
+- Run creation (`RUN_CREATED`), retry scheduling (`RUN_RETRY`), and HITL resumption (`RUN_RESUMED`) write state updates and outbox events inside the **exact same PostgreSQL transaction**.
 - Avoids distributed transaction anomalies between PostgreSQL and Redis.
-- An Outbox Poller continuously sweeps pending records using `SELECT ... FOR UPDATE SKIP LOCKED` where `status = 'PENDING' AND available_at <= NOW()`, publishes to Redis Streams via `XADD`, and marks the outbox event as `PUBLISHED`.
+- An `OutboxPoller` continuously sweeps pending records using `SELECT ... FOR UPDATE SKIP LOCKED` where `status = 'PENDING' AND available_at <= NOW()`, publishes to Redis Streams via `XADD`, transitions ready runs to `QUEUED`, and marks the outbox event as `PUBLISHED`.
 
 ### 2. Multi-Tenant Fairness & Lua Concurrency Rate-Limiter
 - Every tenant has an assigned `max_concurrency` quota.
 - Workers atomically evaluate quota and acquire leases using an atomic Redis Lua script ([acquire_lease.lua](src/redis/scripts/acquire_lease.lua)):
   - Purges expired leases from the tenant's active sorted set.
   - Grants or renews a lease if active count is strictly below `max_concurrency`.
-  - If quota is exceeded, returns `0`. The worker immediately `XACK`s the stream message and places the task into a delayed retry sorted set (`stepforge:delayed_tasks`) with decorrelated jitter, preventing noisy-neighbor starvation.
+  - If quota is exceeded, returns `0`. The worker immediately `XACK`s the stream message and places the task into a delayed retry sorted set (`stepforge:delayed_tasks`) handled by `DelayQueue` with decorrelated jitter, preventing noisy-neighbor starvation.
 
 ### 3. Step Checkpoint Memoization (`step.run`)
 - Workflows are structured as discrete, composable steps:
@@ -115,7 +120,24 @@ It guarantees reliable workflow completion, idempotent step-level retries across
   - `--read-only`: Read-only root filesystem.
   - `--tmpfs /tmp:rw,noexec,nosuid,size=64m`: Sandboxed scratchpad.
   - Hard timeout timer: guaranteed container termination via `docker kill` if elapsed.
-  - Inherits the exact same checkpoint memoization guarantees as native steps.
+  - Inherits the exact same checkpoint memoization guarantees as native steps (`step_type = 'SANDBOX'`).
+
+### 6. Human-in-the-Loop Suspend & Resume (`step.waitForApproval`)
+- Long-running agents can pause safely before high-impact actions without occupying worker threads or tenant concurrency quotas:
+  ```typescript
+  const approval = await step.waitForApproval('confirm-refund-write', {
+    amount: plan.amount,
+    orderId: order.id,
+  });
+  ```
+- If the gate in `run_approvals` is already `APPROVED`, `waitForApproval` returns the memoized approval payload immediately.
+- If `PENDING` (or absent), it atomically persists the gate in `run_approvals`, transitions `runs.status` to `WAITING_HUMAN`, clears lease fields without consuming retry attempts, invokes `onSuspend()` to stop heartbeats and release the worker's Redis concurrency lease (`active_leases` drops to `0`), and halts execution cleanly via `RunSuspendedError`.
+- Calling `POST /api/v1/runs/:runId/approve` or `/reject` records the human decision and atomically inserts a `RUN_RESUMED` outbox event so a worker picks up the run and resumes from saved checkpoints. Rejected gates throw `ApprovalRejectedError` (routing uncaught rejections straight to `DEAD_LETTER`).
+
+### 7. Agent LLM & Tool Step Helpers (`step.llm` / `step.tool`)
+- **`step.llm(stepKey, fn, options?)`**: Tracks execution `latencyMs`, `model`, and `tokenUsage` (either via `helpers.recordUsage(...)` or inferred from `usage`/`tokenUsage`/`tokens` on the output) in `step_checkpoints.metadata` with `step_type = 'LLM'`.
+- **`step.tool(toolName, args, fn, options?)`**: Generates a deterministic canonical-JSON SHA-256 checkpoint key (`tool:<toolName>:<hash>`) unless overridden, recording `{ toolName, args, latencyMs, executedAt }` in `step_checkpoints.metadata` with `step_type = 'TOOL'`.
+- Both wrappers share the exact-once PostgreSQL checkpoint memoization path.
 
 ---
 
@@ -130,18 +152,18 @@ It guarantees reliable workflow completion, idempotent step-level retries across
 docker compose up -d postgres redis
 ```
 
-### 3. Install & Build
+### 3. Install Dependencies
 ```bash
 npm install
-npm run build
 ```
 
-### 4. Run Migrations & Start Server
+### 4. Start the Full Runtime (API + OutboxPoller + DelayQueue + LeaseReaper + Worker)
 ```bash
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/stepforge \
 REDIS_URL=redis://localhost:6379 \
-npm start
+npm run dev
 ```
+This runs migrations (`001_initial_schema.sql`, `002_agent_runtime.sql`), starts the Hono HTTP server, `OutboxPoller`, `DelayQueue`, `LeaseReaper`, and `Worker` (with a default echo workflow handler for unregistered workflow names), and supports graceful `SIGINT`/`SIGTERM` shutdown.
 
 ---
 
@@ -174,7 +196,22 @@ Idempotency-Key: order-req-12345
 }
 ```
 
-### Query Run & Step Checkpoints
+### Approve or Reject a Paused (`WAITING_HUMAN`) Run
+```http
+POST /api/v1/runs/4f3b7d1e-2c8a-4d9f-9a1b-3e5c7d8f9a0b/approve
+Content-Type: application/json
+
+{
+  "gateKey": "confirm-refund-write",
+  "payload": {
+    "approvedBy": "ops-lead-alice",
+    "note": "Verified customer receipt"
+  }
+}
+```
+*(Or `POST /api/v1/runs/:runId/reject` with the same body shape; `gateKey` is optional when there is a single pending gate.)*
+
+### Query Run, Step Checkpoints & Approvals
 ```http
 GET /api/v1/runs/4f3b7d1e-2c8a-4d9f-9a1b-3e5c7d8f9a0b
 ```
@@ -184,21 +221,42 @@ Response:
   "run": {
     "id": "4f3b7d1e-2c8a-4d9f-9a1b-3e5c7d8f9a0b",
     "tenant_id": "tenant-corp-a",
-    "workflow_name": "order-fulfillment",
+    "workflow_name": "ai-refund-agent",
     "status": "COMPLETED",
     "attempt_count": 1,
-    "output": { "status": "shipped" }
+    "output": { "refunded": true }
   },
   "checkpoints": [
     {
-      "step_key": "reserve-inventory",
+      "step_key": "plan-refund",
+      "step_type": "LLM",
       "status": "COMPLETED",
-      "output": { "reserved": true }
+      "metadata": {
+        "model": "gemini-2.5-pro",
+        "tokenUsage": { "promptTokens": 180, "completionTokens": 45, "totalTokens": 225 },
+        "latencyMs": 12
+      },
+      "output": { "action": "issue_refund", "amount": 75 }
     },
     {
-      "step_key": "charge-card",
+      "step_key": "tool:fetch-order-status:a1b2c3d4e5f6",
+      "step_type": "TOOL",
       "status": "COMPLETED",
-      "output": { "paymentRef": "txn_8849" }
+      "metadata": {
+        "toolName": "fetch-order-status",
+        "args": { "orderId": "ORD-999" },
+        "latencyMs": 4
+      },
+      "output": { "paidAmount": 75, "status": "delivered" }
+    }
+  ],
+  "approvals": [
+    {
+      "gate_key": "confirm-refund-write",
+      "status": "APPROVED",
+      "prompt_data": { "proposedAction": "issue_refund", "amount": 75 },
+      "payload": { "approvedBy": "ops-lead-alice", "note": "Verified customer receipt" },
+      "resolved_at": "2026-11-25T08:12:40.000Z"
     }
   ]
 }
@@ -208,9 +266,10 @@ Response:
 
 ## Test Verification Suite
 
-All 4 slices are validated by end-to-end integration tests using real PostgreSQL and Redis containers via Testcontainers:
+All 5 slices and the full wired server runtime are validated by end-to-end integration tests using real PostgreSQL 16 and Redis 7 containers via Testcontainers:
 
 ```bash
+npm run typecheck
 npm test
 ```
 
@@ -238,8 +297,18 @@ npm test
    - --network=none air-gap isolation
    - Durable step memoization of sandboxed outputs
 
- Test Files  4 passed (4)
-      Tests  21 passed (21)
+ ✓ tests/integration/slice5.agent.test.ts (3 tests)
+   - Idempotent 002_agent_runtime.sql migration (WAITING_HUMAN, run_approvals, checkpoint metadata)
+   - Full AI agent HITL flow: step.llm -> step.tool -> step.waitForApproval -> /approve -> step.runSandboxed -> COMPLETED
+   - Verifies Redis active leases drop to 0 in WAITING_HUMAN (no blocking) and prior LLM/tool steps execute strictly once
+   - /reject resumption and DEAD_LETTER handling
+
+ ✓ tests/integration/runtime.e2e.test.ts (2 tests)
+   - Wired startRuntime() executing queued runs to COMPLETED via echo handler
+   - Spawning server/index.ts dev process, completing runs, and exiting 0 cleanly on SIGTERM
+
+ Test Files  6 passed (6)
+      Tests  26 passed (26)
 ```
 
 ---
