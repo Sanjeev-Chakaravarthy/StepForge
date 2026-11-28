@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "node dist/server/index.js",
     "dev": "tsx src/server/index.ts",
+    "inspect": "tsx src/cli/inspect.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "benchmark": "k6 run benchmarks/noisy_neighbor.js"

@@ -167,6 +167,54 @@ This runs migrations (`001_initial_schema.sql`, `002_agent_runtime.sql`), starts
 
 ---
 
+## Quick Inspection & HITL Walkthrough
+
+Inspect live runs, memoized step checkpoints, and `WAITING_HUMAN` approval gates directly from your terminal with the read-only CLI:
+
+```bash
+# 1. List the 20 most recent runs
+npm run inspect -- runs
+
+# 2. Inspect a single run, ordered step_checkpoints, and run_approvals
+npm run inspect -- run <runId>
+
+# 3. List WAITING_HUMAN runs with copy-paste approve/reject curl commands
+npm run inspect -- pending-approvals
+```
+
+*(Uses `DATABASE_URL` and optional `STEPFORGE_URL`, defaulting to `postgresql://postgres:postgres@localhost:5432/stepforge` and `http://localhost:3000`.)*
+
+### 60-Second End-to-End Walkthrough
+
+```bash
+# 1. Create a tenant
+curl -s -X POST http://localhost:3000/api/v1/tenants \
+  -H "Content-Type: application/json" \
+  -d '{"id":"acme","name":"Acme Corp","maxConcurrency":5}' | jq
+
+# 2. Trigger a workflow run (copy the returned run.id)
+curl -s -X POST http://localhost:3000/api/v1/workflows/echo-demo/runs \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-run-001" \
+  -d '{"tenantId":"acme","input":{"orderId":"ORD-999","amount":75}}' | jq
+
+# 3. Inspect recent runs and step checkpoints
+npm run inspect -- runs
+npm run inspect -- run <runId>
+
+# 4. For workflows paused at step.waitForApproval() (WAITING_HUMAN):
+#    List pending gates and run the printed approve command
+npm run inspect -- pending-approvals
+curl -s -X POST http://localhost:3000/api/v1/runs/<runId>/approve \
+  -H "Content-Type: application/json" \
+  -d '{"gateKey":"confirm-refund-write","payload":{"approvedBy":"ops-lead"}}' | jq
+
+# 5. Re-inspect to verify resumed completion and memoized checkpoints
+npm run inspect -- run <runId>
+```
+
+---
+
 ## API Reference
 
 ### Create Tenant
@@ -307,8 +355,11 @@ npm test
    - Wired startRuntime() executing queued runs to COMPLETED via echo handler
    - Spawning server/index.ts dev process, completing runs, and exiting 0 cleanly on SIGTERM
 
- Test Files  6 passed (6)
-      Tests  26 passed (26)
+ ✓ tests/integration/cli.inspect.test.ts (4 tests)
+   - Read-only CLI inspection (runs table, run summary + checkpoints/approvals, pending-approvals curl output)
+
+ Test Files  7 passed (7)
+      Tests  30 passed (30)
 ```
 
 ---
